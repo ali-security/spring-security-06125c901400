@@ -1,11 +1,18 @@
 name: PR Build
 
-on: pull_request
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Gradle test task selector (empty = full build)'
+        required: false
+        default: ''
 
 jobs:
   build:
     name: Build
     runs-on: ubuntu-latest
+    timeout-minutes: 50
 
     steps:
       - uses: actions/checkout@v2
@@ -14,9 +21,63 @@ jobs:
         with:
           java-version: '8'
       - name: Cache Gradle packages
-        uses: actions/cache@v2
+        uses: actions/cache@v4
         with:
           path: ~/.gradle/caches
           key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle') }}
       - name: Build with Gradle
-        run: ./gradlew clean build --continue
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            ./gradlew clean assemble ${{ inputs.test-filter }}
+          else
+            ./gradlew clean build --continue
+          fi
+      - name: Test results summary
+        if: always()
+        run: |
+          python3 - <<'EOF'
+          import glob, re, xml.etree.ElementTree as ET
+          from collections import defaultdict
+          mods = defaultdict(lambda: [0, 0, 0, 0])
+          skipped = []
+          def ignore_reason(cls, name):
+              simple = cls.split('.')[-1].split('$')[0]
+              for path in glob.glob('**/src/*/java/**/' + simple + '.java', recursive=True):
+                  lines = open(path, encoding='utf-8', errors='replace').read().splitlines()
+                  for i, line in enumerate(lines):
+                      if re.search(r'\b' + re.escape(name) + r'\s*\(', line) or re.search(r'class\s+' + simple + r'\b', line):
+                          for j in range(max(0, i - 6), i + 1):
+                              m = re.search(r'@(Ignore|Disabled)\b(.*)', lines[j])
+                              if m:
+                                  rest = m.group(2).strip()
+                                  if rest.startswith('('):
+                                      return 'disabled by upstream: %s at %s:%d' % (lines[j].strip(), path, j + 1)
+                                  return 'disabled by upstream with a bare @%s annotation (upstream gives no reason), at %s:%d `%s`' % (m.group(1), path, j + 1, lines[j].strip())
+              return None
+          for f in glob.glob('**/build/test-results/**/TEST-*.xml', recursive=True):
+              mod = f.split('/build/test-results/')[0]
+              r = ET.parse(f).getroot()
+              m = mods[mod]
+              m[0] += int(r.get('tests', 0)); m[1] += int(r.get('failures', 0)); m[2] += int(r.get('errors', 0)); m[3] += int(r.get('skipped', 0))
+              for tc in r.iter('testcase'):
+                  sk = tc.find('skipped')
+                  if sk is not None:
+                      msg = (sk.get('message') or '').strip()
+                      reason = msg or ignore_reason(tc.get('classname', ''), tc.get('name', '')) or 'skipped by a JUnit assumption (no message recorded)'
+                      skipped.append('%s#%s : %s' % (tc.get('classname'), tc.get('name'), reason))
+          tot = [0, 0, 0, 0]
+          for mod in sorted(mods):
+              t, fl, e, s = mods[mod]
+              tot = [a + b for a, b in zip(tot, mods[mod])]
+              print('TEST MODULE %s: tests=%d passed=%d failures=%d errors=%d skipped=%d' % (mod, t, t - fl - e - s, fl, e, s))
+          for s in skipped:
+              print('TEST SUMMARY | SKIPPED ' + s)
+          t, fl, e, s = tot
+          print('TEST SUMMARY: modules=%d tests=%d passed=%d failures=%d errors=%d skipped=%d' % (len(mods), t, t - fl - e - s, fl, e, s))
+          EOF
+      - name: Upload spring-security-core jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: spring-security-core
+          path: core/build/libs/spring-security-core-5.3.5.RELEASE.jar
+          if-no-files-found: error
